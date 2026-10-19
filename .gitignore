@@ -1,0 +1,14 @@
+.pio/
+.vscode/
+__pycache__/
+include/web_ui.generated.h
+.DS_Store
+node_modules/
+
+.venv/
+.env
+.env.*
+!.env.example
+*.pyc
+config.json
+config.tmp
