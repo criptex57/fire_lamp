@@ -7,6 +7,7 @@
 #include <WiFiUdp.h>
 #include "sync_version.h"
 #include "lamp_registry.h"
+#include "peer_state_cache.h"
 #include "animation.h"
 #include <LittleFS.h>
 #include <ArduinoJson.h>
@@ -40,6 +41,8 @@ bool effectCustomColor[MODE_COUNT] = {};
 uint32_t saveAt = 0, lastFrame = 0;
 WiFiUDP syncUDP;
 LampRegistry lampRegistry;
+PeerStateCache<> peerStates;
+uint32_t maxLoopGapMs = 0, previousLoopMs = 0;
 MDNSResponder::hMDNSServiceQuery lampQuery = nullptr;
 uint32_t lastHello = 0;
 bool helloSent = false;
@@ -81,7 +84,7 @@ void setupTouch() {
   if (touchPin >= 0) pinMode(touchPin, touchActiveLow ? INPUT_PULLUP : INPUT);
   touch.reset(touchIsActive(), millis());
 }
-void markDirty() { dirty = true; saveAt = millis(); }
+void markDirty() { dirty = true; saveAt = millis(); helloSent = false; }
 void factoryReset() {
   dirty = false;
   // Delete app configuration only; do not format the filesystem or touch firmware.
@@ -298,18 +301,33 @@ void pollSync() {
   if (WiFi.status() != WL_CONNECTED) return;
   const int length = syncUDP.parsePacket();
   if (length) {
-    if (length > 768) { syncUDP.flush(); return; }
+    if (length > 1536) { syncUDP.flush(); return; }
     IPAddress source = syncUDP.remoteIP(), local = WiFi.localIP(), mask = WiFi.subnetMask();
     bool localSubnet = source != local;
     for (uint8_t i = 0; i < 4; ++i) localSubnet &= (source[i] & mask[i]) == (local[i] & mask[i]);
-    static char packet[769];
-    const int read = syncUDP.read(packet, 768);
+    static char packet[1537];
+    const int read = syncUDP.read(packet, 1536);
     if (!localSubnet || read <= 0) return;
-    DynamicJsonDocument doc(1536);
+    DynamicJsonDocument doc(3072);
     if (deserializeJson(doc, packet, read)) return;
     if ((doc["discovery"] == 1 || doc["protocol"] == 1) && doc["id"].is<const char*>() && doc["name"].is<const char*>()) {
       receivePresence(doc["id"],doc["name"],source);
-      if (doc["discovery"] == 1) return;
+      if (doc["discovery"] == 1) {
+        JsonObjectConst snapshot = doc["snapshot"].as<JsonObjectConst>();
+        const char* id = snapshot["id"] | "";
+        IPAddress address;
+        const char* ip = snapshot["ip"] | "";
+        if (!snapshot.isNull() && !strcmp(id, doc["id"].as<const char*>()) &&
+            address.fromString(ip) && address == source && snapshot["power"].is<bool>() &&
+            snapshot["name"].is<const char*>() && snapshot["mode"].is<const char*>()) {
+          char body[1024];
+          if (measureJson(snapshot) < sizeof(body)) {
+            size_t length = serializeJson(snapshot, body, sizeof(body));
+            peerStates.store(uint32_t(source), body, length, millis());
+          }
+        }
+        return;
+      }
     }
     if (doc["protocol"] != 1 ||
         !doc["configCounter"].is<uint32_t>() || !doc["configOwner"].is<uint32_t>() ||
@@ -366,6 +384,13 @@ void remoteState() {
     broadcast &= (target[i] | mask[i]) == 255;
   }
   if (!sameSubnet || network || broadcast || target == local || target[0] >= 224 || target[0] == 127) return error(400, "Address must be another lamp on the same subnet");
+  if (server.method() == HTTP_GET) {
+    const char* snapshot = peerStates.get(uint32_t(target), millis());
+    if (!snapshot) return error(503, "No recent lamp snapshot; update both lamps and check Wi-Fi");
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", snapshot);
+    return;
+  }
   String body = server.arg("plain");
   if (body.length() > 1024) return error(413, "Request too large");
   WiFiClient client;
@@ -384,13 +409,23 @@ void remoteState() {
   auto parseError = deserializeJson(result, http.getStream());
   http.end();
   if (parseError) return error(502, "Invalid lamp response");
+  if (status == 200) {
+    char snapshot[1024];
+    if (measureJson(result) < sizeof(snapshot)) {
+      size_t length = serializeJson(result, snapshot, sizeof(snapshot));
+      peerStates.store(uint32_t(target), snapshot, length, millis());
+    }
+  }
   jsonReply(status, result);
 }
 void pollPresence() {
   if (WiFi.status()!=WL_CONNECTED) return;
   if (helloSent && uint32_t(millis()-lastHello)<5000) return;
-  StaticJsonDocument<256> doc;
+  DynamicJsonDocument doc(2048);
   doc["discovery"]=1;doc["id"]=deviceId;doc["name"]=lampName;
+  StaticJsonDocument<1280> snapshot;
+  writeState(snapshot);
+  doc["snapshot"].set(snapshot.as<JsonObjectConst>());
   IPAddress address=WiFi.localIP(),mask=WiFi.subnetMask();
   for(uint8_t i=0;i<4;++i) address[i]|=uint8_t(~mask[i]);
   if(syncUDP.beginPacket(address,SYNC_PORT)) {serializeJson(doc,syncUDP);syncUDP.endPacket();}
@@ -490,7 +525,14 @@ void setup() {
   server.on("/api/state", HTTP_GET, [] { DynamicJsonDocument doc(1280); writeState(doc); jsonReply(200, doc); });
   server.on("/api/state", HTTP_POST, updateState);
   server.on("/api/diagnostics", HTTP_GET, [] {
-    StaticJsonDocument<256> doc;
+    StaticJsonDocument<512> doc;
+    doc["uptimeMs"] = millis();
+    doc["freeHeap"] = ESP.getFreeHeap();
+    doc["maxFreeBlock"] = ESP.getMaxFreeBlockSize();
+    doc["heapFragmentation"] = ESP.getHeapFragmentation();
+    doc["resetReason"] = ESP.getResetReason();
+    doc["maxLoopGapMs"] = maxLoopGapMs;
+    doc["rssi"] = WiFi.RSSI();
     uint32_t energy = 0;
     for (const auto& led : leds) energy += uint16_t(led.r) + led.g + led.b;
     doc["frameEnergy"] = energy;
@@ -558,6 +600,9 @@ void setup() {
   Serial.printf("Touch: GPIO%d, active %s, input %s\n", touchPin, touchActiveLow ? "LOW" : "HIGH", touchIsActive() ? "pressed" : "released");
 }
 void loop() {
+  const uint32_t loopNow = millis();
+  if (previousLoopMs) maxLoopGapMs = max(maxLoopGapMs, uint32_t(loopNow - previousLoopMs));
+  previousLoopMs = loopNow;
   pollTouch();
   server.handleClient();
   pollTouch();
